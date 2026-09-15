@@ -1,0 +1,23 @@
+{
+  "name": "infra-coder",
+  "version": "0.1.0",
+  "author": "Michael E Stallings - 33 North LLC",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "infra-coder": "./bin/infra-coder.mjs"
+  },
+  "scripts": {
+    "dev": "tsx src/index.ts",
+    "build": "tsc --noEmit",
+    "test-all": "node ./scripts/test-all.mjs"
+  },
+  "dependencies": {
+    "@types/node": "^26.5.0",
+    "ollama": "^0.6.3"
+  },
+  "devDependencies": {
+    "tsx": "^4.20.0",
+    "typescript": "^6.0.0"
+  }
+}
