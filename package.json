@@ -13,10 +13,11 @@
     "test-all": "node ./scripts/test-all.mjs"
   },
   "dependencies": {
-    "@types/node": "^26.5.0",
+    "@aws-sdk/client-s3": "^3.687.0",
     "ollama": "^0.6.3"
   },
   "devDependencies": {
+    "@types/node": "^26.6.2",
     "tsx": "^4.20.0",
     "typescript": "^6.0.0"
   }
