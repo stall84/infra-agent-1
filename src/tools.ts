@@ -35,7 +35,7 @@ function assertNotSecretFile(safePath: string): void {
 // This intentionally excludes anything that writes history, pushes, or installs
 // beyond the project (no commit/push/reset/checkout, no arbitrary shell).
 const ALLOWED_COMMANDS: Record<string, Set<string>> = {
-  npm: new Set(["test", "run", "install", "ci", "uninstall", "ls", "list", "outdated", "audit", "build"]),
+  npm: new Set(["test", "run", "install", "ci", "uninstall", "ls", "list", "outdated", "audit", "build", "view"]),
   npx: new Set(["tsc", "vite", "eslint", "prettier", "vitest"]),
   git: new Set(["status", "diff", "log", "show", "branch"]),
 };
@@ -394,7 +394,7 @@ export function createTools(rootDir: string) {
       name: "run_command",
       description:
         "Run an allow-listed command inside the project root to build, test, or inspect the project. " +
-        "Allowed: 'npm' (test/run/install/ci/uninstall/ls/list/outdated/audit/build), 'npx' (tsc/vite/eslint/prettier/vitest), " +
+        "Allowed: 'npm' (test/run/install/ci/uninstall/ls/list/outdated/audit/build/view), 'npx' (tsc/vite/eslint/prettier/vitest), " +
         "and read-only 'git' (status/diff/log/show/branch). Long-running servers (npm run dev/start/preview) are blocked; " +
         "verify with 'npm run build' and 'npm test'. Cannot run arbitrary shell commands or mutate git history.",
       parameters: {

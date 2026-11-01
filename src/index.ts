@@ -119,9 +119,50 @@ if (existsSync(envPath)) {
   console.log("No .env found; S3 tools disabled for this run.");
 }
 
+// Preload the *target project's own* AGENTS.md (if it has one), distinct from this agent's
+// AGENTS.md loaded above as the fixed system prompt. A project AGENTS.md carries
+// project-specific context -- stack, commands, conventions, policies such as a
+// dependency-upgrade policy -- so this same agent can be pointed at any node/npm project
+// and pick up that project's own rules without repeating them in every task string.
+const projectAgentMdPath = path.join(rootDir, "AGENTS.md");
+
+let contextPreamble = "";
+if (existsSync(projectAgentMdPath)) {
+  contextPreamble +=
+    `## Project instructions (AGENTS.md in this project)\n\n${readFileSync(projectAgentMdPath, "utf8")}\n\n` +
+    "Follow these project-specific instructions in addition to your own system prompt. If they ever " +
+    "conflict, keep your own safety boundaries and tool restrictions, but prefer the project's " +
+    "instructions for stack choices, conventions, and policies.\n\n";
+  console.log("Preloaded AGENTS.md from the project.");
+} else {
+  console.log("No AGENTS.md in the project; proceeding with the generic project-inspection workflow.");
+}
+
+// Preload ADR context from the *target project* (rootDir), not this agent's own directory,
+// so the model starts every run knowing past decisions. Individual ADRs are still read
+// on demand via read_file. The ADR template lives outside the sandbox, so it is injected here.
+const adrIndexPath = path.join(rootDir, "docs", "adr", "0000-index.md");
+const adrTemplatePath = path.join(__dirname, "..", "..", "resources", "system-prompts", "format-examples", "adr-format.md");
+
+if (existsSync(adrIndexPath)) {
+  contextPreamble +=
+    `## Existing ADR index (docs/adr/0000-index.md in this project)\n\n${readFileSync(adrIndexPath, "utf8")}\n\n` +
+    `Read individual ADR files with read_file only when relevant. The next ADR ID follows the highest one listed.\n\n`;
+  console.log("Preloaded docs/adr/0000-index.md from the project.");
+} else {
+  contextPreamble +=
+    "## ADR index\n\nThis project has no docs/adr/0000-index.md yet. Create it with your first ADR (ID 0001).\n\n";
+  console.log("No docs/adr/0000-index.md in the project yet.");
+}
+if (existsSync(adrTemplatePath)) {
+  contextPreamble += `## ADR record template\n\nUse this format for new ADR files:\n\n${readFileSync(adrTemplatePath, "utf8")}\n\n`;
+} else {
+  console.log(`ADR template not found at ${adrTemplatePath}`);
+}
+
 const messages: Message[] = [
   { role: "system", content: systemPrompt },
-  { role: "user", content: taskDescription },
+  { role: "user", content: `${contextPreamble}## Task\n\n${taskDescription}` },
 ];
 
 let finishedCleanly = false;
