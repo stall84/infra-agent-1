@@ -1,4 +1,4 @@
-import { readFile, readdir, writeFile, mkdir } from "node:fs/promises";
+import { readFile, readdir, writeFile, mkdir, rm, stat } from "node:fs/promises";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import * as path from "node:path";
@@ -35,17 +35,25 @@ function assertNotSecretFile(safePath: string): void {
 // This intentionally excludes anything that writes history, pushes, or installs
 // beyond the project (no commit/push/reset/checkout, no arbitrary shell).
 const ALLOWED_COMMANDS: Record<string, Set<string>> = {
-  npm: new Set(["test", "run", "install", "ci", "ls", "list", "outdated", "audit", "build"]),
+  npm: new Set(["test", "run", "install", "ci", "uninstall", "ls", "list", "outdated", "audit", "build", "view"]),
+  npx: new Set(["tsc", "vite", "eslint", "prettier", "vitest"]),
   git: new Set(["status", "diff", "log", "show", "branch"]),
 };
 
+// Directories never worth listing/searching (huge and irrelevant to the model).
+const IGNORED_DIRS = new Set(["node_modules", ".git", "dist", "build", ".next", ".turbo", "coverage"]);
+const MAX_READ_CHARS = 40_000;
+const MAX_SEARCH_RESULTS = 100;
+
 // "npm run dev" starts this very agent, which would call an LLM that could call
 // "npm run dev" again -- an unbounded, resource-consuming recursive spawn.
-const BLOCKED_NPM_RUN_SCRIPTS = new Set(["dev"]);
+// Long-running servers (dev/start/preview/serve/watch) never exit and would just hit the
+// command timeout, so they are blocked outright; verify with build/test instead.
+const BLOCKED_NPM_RUN_SCRIPTS = new Set(["dev", "start", "preview", "serve", "watch"]);
 
 // Blocks shell metacharacters/injection attempts even though execFile never
 // spawns a shell; this keeps arguments limited to plausible CLI tokens.
-const SAFE_ARG = /^[A-Za-z0-9_.:@/=-]+$/;
+const SAFE_ARG = /^[A-Za-z0-9_.:@/=^~+-]+$/;
 
 /** Resolves a user-supplied path against the sandbox root and rejects escapes. */
 function resolveSafePath(rootDir: string, inputPath: string): string {
@@ -64,15 +72,122 @@ function resolveSafePath(rootDir: string, inputPath: string): string {
  * scoped to operate only within `rootDir`.
  */
 export function createTools(rootDir: string) {
-  async function listFiles(dirPath: string): Promise<string[]> {
+  async function listFiles(dirPath: string, recursive = false): Promise<string[]> {
     const safePath = resolveSafePath(rootDir, dirPath);
-    return await readdir(safePath);
+    if (!recursive) {
+      const entries = await readdir(safePath, { withFileTypes: true });
+      return entries.map((e) => (e.isDirectory() ? `${e.name}/` : e.name));
+    }
+    const out: string[] = [];
+    const walk = async (dir: string): Promise<void> => {
+      for (const e of await readdir(dir, { withFileTypes: true })) {
+        if (e.isDirectory()) {
+          if (IGNORED_DIRS.has(e.name)) continue;
+          await walk(path.join(dir, e.name));
+        } else if (out.length < 500) {
+          out.push(path.relative(safePath, path.join(dir, e.name)));
+        }
+      }
+    };
+    await walk(safePath);
+    return out;
   }
 
-  async function readTextFile(filePath: string): Promise<string> {
+  async function readTextFile(
+    filePath: string,
+    startLine?: number,
+    endLine?: number
+  ): Promise<string> {
     const safePath = resolveSafePath(rootDir, filePath);
     assertNotSecretFile(safePath);
-    return await readFile(safePath, "utf8");
+    const text = await readFile(safePath, "utf8");
+    if (startLine === undefined && endLine === undefined) {
+      if (text.length > MAX_READ_CHARS) {
+        return (
+          text.slice(0, MAX_READ_CHARS) +
+          `\n[truncated at ${MAX_READ_CHARS} chars; re-read with start_line/end_line for the rest]`
+        );
+      }
+      return text;
+    }
+    const lines = text.split("\n");
+    const start = Math.max(1, startLine ?? 1);
+    const end = Math.min(lines.length, endLine ?? lines.length);
+    return lines
+      .slice(start - 1, end)
+      .map((l, i) => `${start + i}: ${l}`)
+      .join("\n");
+  }
+
+  async function editTextFile(
+    filePath: string,
+    oldText: string,
+    newText: string
+  ): Promise<{ path: string; replaced: number }> {
+    const safePath = resolveSafePath(rootDir, filePath);
+    assertNotSecretFile(safePath);
+    if (!oldText) throw new Error("old_text must not be empty.");
+    const text = await readFile(safePath, "utf8");
+    const count = text.split(oldText).length - 1;
+    if (count === 0) {
+      throw new Error("old_text was not found in the file. Re-read the file and copy the text exactly.");
+    }
+    if (count > 1) {
+      throw new Error(
+        `old_text matches ${count} places; include more surrounding context so it matches exactly once.`
+      );
+    }
+    await writeFile(safePath, text.replace(oldText, () => newText), "utf8");
+    return { path: path.relative(rootDir, safePath), replaced: 1 };
+  }
+
+  async function deleteTextFile(filePath: string): Promise<{ path: string; deleted: true }> {
+    const safePath = resolveSafePath(rootDir, filePath);
+    assertNotSecretFile(safePath);
+    if (safePath === rootDir) throw new Error("Refusing to delete the project root.");
+    const info = await stat(safePath);
+    if (info.isDirectory()) {
+      throw new Error("delete_file only deletes single files, not directories.");
+    }
+    await rm(safePath);
+    return { path: path.relative(rootDir, safePath), deleted: true };
+  }
+
+  async function searchFiles(
+    pattern: string,
+    dirPath = "."
+  ): Promise<Array<{ file: string; line: number; text: string }>> {
+    const safePath = resolveSafePath(rootDir, dirPath);
+    const needle = pattern.toLowerCase();
+    const results: Array<{ file: string; line: number; text: string }> = [];
+    const walk = async (dir: string): Promise<void> => {
+      for (const e of await readdir(dir, { withFileTypes: true })) {
+        if (results.length >= MAX_SEARCH_RESULTS) return;
+        const full = path.join(dir, e.name);
+        if (e.isDirectory()) {
+          if (!IGNORED_DIRS.has(e.name)) await walk(full);
+        } else if (!SECRET_FILE_PATTERN.test(e.name)) {
+          const info = await stat(full);
+          if (info.size > 1_000_000) continue;
+          const buf = await readFile(full);
+          if (buf.includes(0)) continue; // binary
+          buf
+            .toString("utf8")
+            .split("\n")
+            .forEach((l, i) => {
+              if (results.length < MAX_SEARCH_RESULTS && l.toLowerCase().includes(needle)) {
+                results.push({
+                  file: path.relative(rootDir, full),
+                  line: i + 1,
+                  text: l.trim().slice(0, 200),
+                });
+              }
+            });
+        }
+      }
+    };
+    await walk(safePath);
+    return results;
   }
 
   async function writeTextFile(
@@ -116,7 +231,7 @@ export function createTools(rootDir: string) {
     }
     if (executable === "npm" && subcommand === "run" && args[1] && BLOCKED_NPM_RUN_SCRIPTS.has(args[1])) {
       throw new Error(
-        `Running "npm run ${args[1]}" is blocked because it would recursively launch this agent itself.`
+        `Running "npm run ${args[1]}" is blocked: it starts a long-running server that never exits. Use "npm run build" or "npm test" to verify instead.`
       );
     }
 
@@ -147,14 +262,19 @@ export function createTools(rootDir: string) {
     function: {
       name: "list_files",
       description:
-        "List the files and directories in a given directory, relative to the project root.",
+        "List the files and directories in a given directory, relative to the project root. " +
+        "Directories end with '/'. Set recursive=true to see the whole tree (skips node_modules, .git, dist, build).",
       parameters: {
         type: "object",
         required: ["path"],
         properties: {
           path: {
             type: "string",
-            description: "The directory path to list, relative to the project root.",
+            description: "The directory path to list, relative to the project root. Use '.' for the root.",
+          },
+          recursive: {
+            type: "boolean",
+            description: "List all files in subdirectories too. Defaults to false.",
           },
         },
       },
@@ -174,6 +294,14 @@ export function createTools(rootDir: string) {
           path: {
             type: "string",
             description: "The path of the text file to read, relative to the project root.",
+          },
+          start_line: {
+            type: "number",
+            description: "Optional 1-based first line to return (output is prefixed with line numbers).",
+          },
+          end_line: {
+            type: "number",
+            description: "Optional 1-based last line to return.",
           },
         },
       },
@@ -203,14 +331,72 @@ export function createTools(rootDir: string) {
     },
   };
 
+  const editFileTool = {
+    type: "function",
+    function: {
+      name: "edit_file",
+      description:
+        "Edit an existing file by replacing one exact occurrence of old_text with new_text. Prefer this over " +
+        "write_file for small changes to existing files. old_text must match the file exactly (including " +
+        "whitespace) and appear exactly once; add surrounding lines for uniqueness.",
+      parameters: {
+        type: "object",
+        required: ["path", "old_text", "new_text"],
+        properties: {
+          path: { type: "string", description: "File path relative to the project root." },
+          old_text: { type: "string", description: "Exact existing text to replace." },
+          new_text: { type: "string", description: "Replacement text." },
+        },
+      },
+    },
+  };
+
+  const deleteFileTool = {
+    type: "function",
+    function: {
+      name: "delete_file",
+      description:
+        "Delete a single file inside the project root (e.g. an obsolete component). Cannot delete directories.",
+      parameters: {
+        type: "object",
+        required: ["path"],
+        properties: {
+          path: { type: "string", description: "File path relative to the project root." },
+        },
+      },
+    },
+  };
+
+  const searchFilesTool = {
+    type: "function",
+    function: {
+      name: "search_files",
+      description:
+        "Case-insensitive plain-text search across files (skips node_modules, .git, dist, build, binaries, and " +
+        "secret files). Returns up to 100 matches as file/line/text. Use it to find where something is defined or used.",
+      parameters: {
+        type: "object",
+        required: ["pattern"],
+        properties: {
+          pattern: { type: "string", description: "Text to search for." },
+          path: {
+            type: "string",
+            description: "Directory to search, relative to the project root. Defaults to '.'.",
+          },
+        },
+      },
+    },
+  };
+
   const runCommandTool = {
     type: "function",
     function: {
       name: "run_command",
       description:
         "Run an allow-listed command inside the project root to build, test, or inspect the project. " +
-        "Only 'npm' (test/run/install/ci/ls/list/outdated/audit/build) and 'git' (status/diff/log/show/branch) " +
-        "are permitted. Cannot run arbitrary shell commands or mutate git history.",
+        "Allowed: 'npm' (test/run/install/ci/uninstall/ls/list/outdated/audit/build/view), 'npx' (tsc/vite/eslint/prettier/vitest), " +
+        "and read-only 'git' (status/diff/log/show/branch). Long-running servers (npm run dev/start/preview) are blocked; " +
+        "verify with 'npm run build' and 'npm test'. Cannot run arbitrary shell commands or mutate git history.",
       parameters: {
         type: "object",
         required: ["executable", "args"],
@@ -235,10 +421,16 @@ export function createTools(rootDir: string) {
     listFiles,
     readTextFile,
     writeTextFile,
+    editTextFile,
+    deleteTextFile,
+    searchFiles,
     runCommand,
     listFilesTool,
     readFileTool,
     writeFileTool,
+    editFileTool,
+    deleteFileTool,
+    searchFilesTool,
     runCommandTool,
   };
 }
